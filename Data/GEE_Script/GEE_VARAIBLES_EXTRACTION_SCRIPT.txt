@@ -1,0 +1,176 @@
+/**
+ * Longitudinal Desertification Feature Extraction (2000–2025)
+ * Primary Climate Driver: NASA GLDAS 2.1 Noah (2000-Present)
+ * Regions: Borno/Yobe (Nigeria) & Kalmykia (Russia)
+ */
+
+// =========================================================================
+// 1. Assets & Spatial Parameters
+// =========================================================================
+
+var bornoYobe = ee.FeatureCollection("projects/disaster-management-474719/assets/BornoYobe");
+var kalmykia  = ee.FeatureCollection("projects/disaster-management-474719/assets/Kalmykia");
+
+var scale = 5566; // ~0.05 degrees grid scale
+var startYear = 2000;
+var endYear = 2025;
+
+// Static Feature: X10 Elevation (SRTM)
+var elevationImage = ee.Image("USGS/SRTMGL1_003").select('elevation').rename('X10_Elevation');
+
+// Spatial Coordinates Image
+var coords = ee.Image.pixelLonLat().rename(['Longitude', 'Latitude']);
+
+// =========================================================================
+// 2. Extraction Pipeline Function (GLDAS 2.1 Based)
+// =========================================================================
+
+function buildLongitudinalPanel(roi) {
+  var roiGeom = roi.geometry();
+
+  // CHIRPS Long-Term Baseline (2000-2025 Mean)
+  var chirpsBaseline = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+    .filterBounds(roiGeom)
+    .filterDate('2000-01-01', '2025-12-31')
+    .select('precipitation')
+    .sum()
+    .divide(26);
+
+  var yearlyList = [];
+
+  for (var y = startYear; y <= endYear; y++) {
+    var startDate = ee.Date.fromYMD(y, 1, 1);
+    var endDate   = ee.Date.fromYMD(y, 12, 31);
+
+    // TARGET: MOD13Q1 Annual Mean NDVI
+    var targetNDVI = ee.ImageCollection("MODIS/061/MOD13Q1")
+      .filterBounds(roiGeom)
+      .filterDate(startDate, endDate)
+      .select('NDVI')
+      .mean()
+      .multiply(0.0001)
+      .rename('Target_NDVI');
+
+    // NASA GLDAS 2.1 Noah Collection (3-hourly aggregated to annual)
+    var gldas = ee.ImageCollection("NASA/GLDAS/V021/NOAH/G025/T3H")
+      .filterBounds(roiGeom)
+      .filterDate(startDate, endDate);
+
+    // Predictors X1 - X8 derived from GLDAS
+    // X1: Rain (kg/m2/s -> mm/yr)
+    var P_antecedent = gldas.select('Rainf_f_tavg').mean().multiply(86400 * 365).rename('X1_Rain_P_antecedent');
+    
+    // X2: Temperature Max (K -> °C)
+    var T_max = gldas.select('Tair_f_inst').max().subtract(273.15).rename('X2_Max_Temp_Tmax');
+
+    // X3: Vapor Pressure Deficit (VPD)
+    var T_mean = gldas.select('Tair_f_inst').mean().subtract(273.15);
+    var Q_air = gldas.select('Qair_f_inst').mean();
+    var Press = gldas.select('Psurf_f_inst').mean();
+    
+    var e_sat = T_mean.expression('0.61078 * exp((17.27 * T) / (T + 237.3))', {'T': T_mean});
+    var e_act = Q_air.multiply(Press).divide(0.622 * 1000); // Vapor pressure in kPa
+    var VPD = e_sat.subtract(e_act).max(0).rename('X3_Vapor_Deficit_VPD');
+
+    // X4 & X5: PET, AET, AI, ESI
+    var PET = gldas.select('PotEvap_tavg').mean().multiply(86400 * 365).rename('PET');
+    var AET = gldas.select('Evap_tavg').mean().multiply(86400 * 365).rename('AET');
+
+    var AridityIndex = P_antecedent.divide(PET).rename('X4_Aridity_Index_AI');
+    var ESI = AET.divide(PET).rename('X5_Evaporative_Stress_ESI');
+    
+    // X6 & X7: Latent Heat & Surface Albedo
+    var LatentHeat = gldas.select('Qle_tavg').mean().rename('X6_Latent_Heat_LE');
+    var Albedo = gldas.select('Albedo_inst').mean().rename('X7_Surface_Albedo');
+
+    // X8: Root-Zone Soil Moisture (0-40cm)
+    var SM1 = gldas.select('SoilMoi0_10cm_inst').mean();
+    var SM2 = gldas.select('SoilMoi10_40cm_inst').mean();
+    var SM_root = SM1.add(SM2).divide(2).rename('X8_Soil_Moisture_SMroot');
+
+    // X9: CHIRPS Rainfall Anomaly
+    var chirpsAnnual = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+      .filterBounds(roiGeom)
+      .filterDate(startDate, endDate)
+      .select('precipitation')
+      .sum();
+    var Rain_Anomaly = chirpsAnnual.subtract(chirpsBaseline).rename('X9_Rainfall_Anomaly');
+
+    // Metadata Constant Year Image
+    var yearImg = ee.Image.constant(y).rename('Year');
+
+    // Stack all 14 rasters into a single multi-band image
+    var annualStack = ee.Image.cat([
+      yearImg,
+      coords,
+      targetNDVI,
+      P_antecedent,
+      T_max,
+      VPD,
+      AridityIndex,
+      ESI,
+      LatentHeat,
+      Albedo,
+      SM_root,
+      Rain_Anomaly,
+      elevationImage
+    ]).clip(roiGeom);
+
+    // Sample points systematically
+    var sampledYear = annualStack.sample({
+      region: roiGeom,
+      scale: scale,
+      projection: 'EPSG:4326',
+      geometries: false,
+      dropNulls: true
+    });
+
+    yearlyList.push(sampledYear);
+  }
+
+  return ee.FeatureCollection(yearlyList).flatten();
+}
+
+// =========================================================================
+// 3. Build Panel Collections
+// =========================================================================
+
+var panelBornoYobe = buildLongitudinalPanel(bornoYobe);
+var panelKalmykia  = buildLongitudinalPanel(kalmykia);
+
+// =========================================================================
+// 4. Export Tasks Configuration
+// =========================================================================
+
+var fieldSelectors = [
+  'Year',
+  'Longitude',
+  'Latitude',
+  'Target_NDVI',
+  'X1_Rain_P_antecedent',
+  'X2_Max_Temp_Tmax',
+  'X3_Vapor_Deficit_VPD',
+  'X4_Aridity_Index_AI',
+  'X5_Evaporative_Stress_ESI',
+  'X6_Latent_Heat_LE',
+  'X7_Surface_Albedo',
+  'X8_Soil_Moisture_SMroot',
+  'X9_Rainfall_Anomaly',
+  'X10_Elevation'
+];
+
+Export.table.toDrive({
+  collection: panelBornoYobe,
+  description: 'Panel_BornoYobe_2000_2025_GLDAS',
+  fileFormat: 'CSV',
+  selectors: fieldSelectors
+});
+
+Export.table.toDrive({
+  collection: panelKalmykia,
+  description: 'Panel_Kalmykia_2000_2025_GLDAS',
+  fileFormat: 'CSV',
+  selectors: fieldSelectors
+});
+
+print("GLDAS 2.1 execution stack ready. Run both tasks in the Tasks tab.");
