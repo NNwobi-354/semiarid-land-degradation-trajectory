@@ -1,0 +1,152 @@
+/**
+ * ==============================================================================
+ * GEE SCRIPT: EXPORT INDIVIDUAL GEOTIFF BANDS FOR NDVI TRENDS & SIGNIFICANCE
+ * ==============================================================================
+ * Exports individual single-band GeoTIFFs directly to Google Drive:
+ *  1. Sens_Slope (Annual NDVI change)
+ *  2. t_statistic (Statistical significance metric)
+ *  3. Significant_Trend (1 = Sig Greening, -1 = Sig Browning, 0 = Non-Sig)
+ */
+
+// 1. LOAD USER ASSETS
+var kalmykia = ee.FeatureCollection("projects/soy-involution-501718-r9/assets/Kalmykia");
+var bornoYobe = ee.FeatureCollection("projects/soy-involution-501718-r9/assets/BornoYobe");
+
+var studyAreas = [
+  { name: 'Borno_Yobe', geometry: bornoYobe },
+  { name: 'Kalmykia', geometry: kalmykia }
+];
+
+// 2. DEFINE TIME PERIOD & DATASET
+var startYear = 2000;
+var endYear = 2025;
+var nYears = endYear - startYear + 1;
+
+// Load MODIS 500m 16-day NDVI (MOD13A1)
+var modisNDVI = ee.ImageCollection("MODIS/061/MOD13A1")
+  .filterDate(startYear + '-01-01', endYear + '-12-31')
+  .select('NDVI')
+  .map(function(img) {
+    return img.multiply(0.0001)
+      .copyProperties(img, ['system:time_start']);
+  });
+
+// Create Annual Mean NDVI Collection
+var years = ee.List.sequence(startYear, endYear);
+var annualNDVI = ee.ImageCollection.fromImages(
+  years.map(function(y) {
+    var yearNum = ee.Number(y);
+    var annualMean = modisNDVI
+      .filter(ee.Filter.calendarRange(yearNum, yearNum, 'year'))
+      .mean()
+      .set('year', yearNum)
+      .set('system:time_start', ee.Date.fromYMD(yearNum, 6, 1).millis());
+    return annualMean;
+  })
+);
+
+// 3. STATISTICAL TREND & SIGNIFICANCE COMPUTATION
+function computeTrend(annualCol, regionGeom) {
+  var colWithTime = annualCol.map(function(img) {
+    var year = ee.Number(img.get('year')).subtract(startYear);
+    var timeImg = ee.Image.constant(year).toFloat().rename('time');
+    var constantImg = ee.Image.constant(1).toFloat().rename('constant');
+    return constantImg.addBands(timeImg).addBands(img.select('NDVI').toFloat());
+  });
+
+  // Calculate Sen's Slope
+  var sensSlope = colWithTime.select(['time', 'NDVI'])
+    .reduce(ee.Reducer.sensSlope())
+    .select('slope')
+    .rename('Sens_Slope');
+
+  // Calculate Linear Regression for t-stats
+  var regression = colWithTime.select(['constant', 'time', 'NDVI'])
+    .reduce(ee.Reducer.linearRegression(2, 1));
+
+  var coefficients = regression.select('coefficients');
+  var residuals = regression.select('residuals');
+  
+  var df = nYears - 2;
+  var variance = residuals.arrayGet([0]).pow(2).divide(df);
+
+  var timeMean = (nYears - 1) / 2;
+  var sumSquareTime = ee.List.sequence(0, nYears - 1)
+    .map(function(t) { return ee.Number(t).subtract(timeMean).pow(2); })
+    .reduce(ee.Reducer.sum());
+
+  var seSlope = variance.divide(ee.Number(sumSquareTime)).sqrt();
+  var tStat = coefficients.arrayGet([1, 0]).divide(seSlope).abs().rename('t_statistic');
+  
+  // Critical t-value for alpha = 0.05 (two-tailed, df ~ 24) is approx 2.064
+  var isSignificant = tStat.gte(2.064);
+
+  var sigGreening = sensSlope.gt(0).and(isSignificant);
+  var sigBrowning = sensSlope.lt(0).and(isSignificant);
+
+  var sigTrend = ee.Image(0)
+    .where(sigGreening, 1)
+    .where(sigBrowning, -1)
+    .rename('Significant_Trend');
+
+  return {
+    slope: sensSlope.clip(regionGeom),
+    tStat: tStat.clip(regionGeom),
+    sigTrend: sigTrend.clip(regionGeom)
+  };
+}
+
+// 4. PROCESS AND EXPORT INDIVIDUAL BANDS FOR EACH REGION
+studyAreas.forEach(function(area) {
+  var trendResults = computeTrend(annualNDVI, area.geometry);
+
+  // Visualization Setup in GEE Canvas
+  var trendVis = {
+    min: -0.01,
+    max: 0.01,
+    palette: ['#d7191c', '#fdae61', '#ffffbf', '#a6d96a', '#1a9641']
+  };
+
+  Map.centerObject(area.geometry, 6);
+  Map.addLayer(trendResults.slope, trendVis, area.name + ' NDVI Sens Slope');
+  Map.addLayer(trendResults.sigTrend, {min: -1, max: 1, palette: ['red', 'white', 'green']}, area.name + ' Sig Trends (p<0.05)');
+
+  // EXPORT 1: SEN'S SLOPE GEOTIFF
+  Export.image.toDrive({
+    image: trendResults.slope,
+    description: area.name + '_NDVI_Sens_Slope',
+    folder: 'GEE_NDVI_Trends',
+    fileNamePrefix: area.name + '_NDVI_Sens_Slope',
+    scale: 500,
+    region: area.geometry.geometry().bounds(),
+    maxPixels: 1e9,
+    crs: 'EPSG:4326',
+    fileFormat: 'GeoTIFF'
+  });
+
+  // EXPORT 2: T-STATISTIC GEOTIFF
+  Export.image.toDrive({
+    image: trendResults.tStat,
+    description: area.name + '_NDVI_t_statistic',
+    folder: 'GEE_NDVI_Trends',
+    fileNamePrefix: area.name + '_NDVI_t_statistic',
+    scale: 500,
+    region: area.geometry.geometry().bounds(),
+    maxPixels: 1e9,
+    crs: 'EPSG:4326',
+    fileFormat: 'GeoTIFF'
+  });
+
+  // EXPORT 3: SIGNIFICANT TREND MASK GEOTIFF (p < 0.05)
+  Export.image.toDrive({
+    image: trendResults.sigTrend,
+    description: area.name + '_NDVI_Significant_Trend_Mask',
+    folder: 'GEE_NDVI_Trends',
+    fileNamePrefix: area.name + '_NDVI_Significant_Trend_Mask',
+    scale: 500,
+    region: area.geometry.geometry().bounds(),
+    maxPixels: 1e9,
+    crs: 'EPSG:4326',
+    fileFormat: 'GeoTIFF'
+  });
+});
